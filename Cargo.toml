@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
+ctrlc = "3.4"
 
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
@@ -16,3 +17,6 @@ winapi = { version = "0.3", features = ["processthreadsapi", "minwinbase", "winn
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 nix = { version = "0.27", features = ["process", "signal"] }
+
+# Cross-platform signal handling
+ctrlc = "3.4"

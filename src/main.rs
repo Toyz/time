@@ -1,6 +1,8 @@
 use clap::Parser;
 use std::process::{Command, Stdio};
 use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Windows-specific imports
 #[cfg(windows)]
@@ -188,7 +190,7 @@ fn format_memory(kb: u64) -> String {
     }
 }
 
-fn execute_and_measure(args: &Args) -> Result<(std::process::ExitStatus, f64, ResourceUsage), Box<dyn std::error::Error>> {
+fn execute_and_measure(args: &Args, interrupted: Arc<AtomicBool>) -> Result<(std::process::ExitStatus, f64, ResourceUsage, bool), Box<dyn std::error::Error>> {
     let program = &args.command[0];
     let program_args = if args.command.len() > 1 {
         &args.command[1..]
@@ -211,11 +213,12 @@ fn execute_and_measure(args: &Args) -> Result<(std::process::ExitStatus, f64, Re
         
         let exit_status = child.wait()?;
         let wall_elapsed = wall_start.elapsed().as_secs_f64();
+        let was_interrupted = interrupted.load(Ordering::SeqCst);
         
-        Ok((exit_status, wall_elapsed, ResourceUsage::default()))
+        Ok((exit_status, wall_elapsed, ResourceUsage::default(), was_interrupted))
     } else {
         // Platform-optimized mode
-        execute_platform_optimized(program, program_args, wall_start)
+        execute_platform_optimized(program, program_args, wall_start, interrupted)
     }
 }
 
@@ -224,7 +227,8 @@ fn execute_platform_optimized(
     program: &str,
     args: &[String],
     wall_start: Instant,
-) -> Result<(std::process::ExitStatus, f64, ResourceUsage), Box<dyn std::error::Error>> {
+    interrupted: Arc<AtomicBool>,
+) -> Result<(std::process::ExitStatus, f64, ResourceUsage, bool), Box<dyn std::error::Error>> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::inherit())
@@ -236,10 +240,11 @@ fn execute_platform_optimized(
     let child_id = child.id();
     let exit_status = child.wait()?;
     let wall_elapsed = wall_start.elapsed().as_secs_f64();
+    let was_interrupted = interrupted.load(Ordering::SeqCst);
     
     let resource_usage = get_child_process_times(child_id).unwrap_or_default();
     
-    Ok((exit_status, wall_elapsed, resource_usage))
+    Ok((exit_status, wall_elapsed, resource_usage, was_interrupted))
 }
 
 #[cfg(unix)]
@@ -247,7 +252,8 @@ fn execute_platform_optimized(
     program: &str,
     args: &[String],
     wall_start: Instant,
-) -> Result<(std::process::ExitStatus, f64, ResourceUsage), Box<dyn std::error::Error>> {
+    interrupted: Arc<AtomicBool>,
+) -> Result<(std::process::ExitStatus, f64, ResourceUsage, bool), Box<dyn std::error::Error>> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::inherit())
@@ -259,10 +265,11 @@ fn execute_platform_optimized(
     let child_id = child.id();
     let exit_status = child.wait()?;
     let wall_elapsed = wall_start.elapsed().as_secs_f64();
+    let was_interrupted = interrupted.load(Ordering::SeqCst);
     
     let resource_usage = get_child_process_times(child_id).unwrap_or_default();
     
-    Ok((exit_status, wall_elapsed, resource_usage))
+    Ok((exit_status, wall_elapsed, resource_usage, was_interrupted))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -272,6 +279,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: No command specified");
         std::process::exit(1);
     }
+    
+    // Set up signal handling for Ctrl+C, etc.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_clone = interrupted.clone();
+    
+    ctrlc::set_handler(move || {
+        interrupted_clone.store(true, Ordering::SeqCst);
+    })?;
     
     // Detect platform for informational purposes
     let platform = if cfg!(windows) {
@@ -292,49 +307,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Execute the command and measure resources
-    let (exit_status, wall_seconds, resource_usage) = execute_and_measure(&args)?;
+    let (exit_status, wall_seconds, resource_usage, was_interrupted) = execute_and_measure(&args, interrupted.clone())?;
     
     // Format timing information
     let timing_info = if args.verbose {
-        let mut info = format!(
-            "\nCommand: {}\nExit status: {}\nElapsed (wall clock) time: {}\nUser time: {}\nSystem time: {}\nCPU usage: {:.1}%",
-            args.command.join(" "),
-            exit_status.code().map_or("signal".to_string(), |c| c.to_string()),
-            format_time(wall_seconds),
-            format_time(resource_usage.user_time),
-            format_time(resource_usage.system_time),
-            if wall_seconds > 0.0 { 
-                ((resource_usage.user_time + resource_usage.system_time) / wall_seconds) * 100.0 
-            } else { 
-                0.0 
-            }
-        );
+        let command_str = args.command.join(" ");
+        let exit_str = if was_interrupted {
+            "interrupted".to_string()
+        } else {
+            exit_status.code().map_or("signal".to_string(), |c| c.to_string())
+        };
+        let cpu_usage = if wall_seconds > 0.0 { 
+            ((resource_usage.user_time + resource_usage.system_time) / wall_seconds) * 100.0 
+        } else { 
+            0.0 
+        };
+        
+        let mut lines = vec![
+            format!("Command:             {}", command_str),
+            format!("Exit status:         {}", exit_str),
+            format!("Elapsed time:        {}", format_time(wall_seconds)),
+            format!("User time:           {}", format_time(resource_usage.user_time)),
+            format!("System time:         {}", format_time(resource_usage.system_time)),
+            format!("CPU usage:           {:.1}%", cpu_usage),
+        ];
         
         if resource_usage.max_memory > 0 {
-            info.push_str(&format!("\nMaximum memory: {}", format_memory(resource_usage.max_memory)));
+            lines.push(format!("Peak memory:         {}", format_memory(resource_usage.max_memory)));
         }
         
-        info.push('\n');
-        info
+        format!("\n{}\n", lines.join("\n"))
     } else {
-        // Standard Unix time format
+        // Standard Unix time format - exactly like real time command
         format!(
-            "\nreal    {}\nuser    {}\nsys     {}\n",
+            "\nreal\t{}\nuser\t{}\nsys\t{}\n",
             format_time(wall_seconds),
             format_time(resource_usage.user_time),
             format_time(resource_usage.system_time)
         )
     };
     
-    // Output timing information
+    // Output timing information - always show it, even if interrupted
     if let Some(output_file) = args.output_file {
         std::fs::write(output_file, timing_info)?;
     } else {
         eprint!("{}", timing_info);
     }
     
-    // Exit with the same status as the executed command
-    if let Some(code) = exit_status.code() {
+    // Exit with appropriate code
+    if was_interrupted {
+        std::process::exit(130); // Standard Unix exit code for SIGINT
+    } else if let Some(code) = exit_status.code() {
         std::process::exit(code);
     } else {
         // Command was terminated by signal (Unix behavior)
