@@ -1,0 +1,18 @@
+[package]
+name = "time"
+version = "0.1.0"
+edition = "2021"
+description = "A cross-platform Unix-like time command"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+
+# Windows-specific dependencies
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "minwinbase", "winnt", "handleapi"] }
+
+# Unix-like systems (Linux, macOS, etc.)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.27", features = ["process", "signal"] }
