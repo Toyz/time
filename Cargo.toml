@@ -10,7 +10,7 @@ clap = { version = "4.0", features = ["derive"] }
 
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "minwinbase", "winnt", "handleapi"] }
+winapi = { version = "0.3", features = ["processthreadsapi", "minwinbase", "winnt", "handleapi", "psapi"] }
 
 # Unix-like systems (Linux, macOS, etc.)
 [target.'cfg(unix)'.dependencies]

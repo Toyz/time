@@ -8,9 +8,11 @@ use winapi::um::processthreadsapi::{GetProcessTimes, OpenProcess};
 #[cfg(windows)]
 use winapi::shared::minwindef::FILETIME;
 #[cfg(windows)]
-use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION};
+use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION};
 #[cfg(windows)]
 use winapi::um::handleapi::CloseHandle;
+#[cfg(windows)]
+use winapi::um::psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 
 // Unix-specific imports  
 #[cfg(unix)]
@@ -63,9 +65,13 @@ fn filetime_to_seconds(ft: &FILETIME) -> f64 {
 #[cfg(windows)]
 fn get_child_process_times(child_id: u32) -> Result<ResourceUsage, Box<dyn std::error::Error>> {
     unsafe {
-        let handle: HANDLE = OpenProcess(PROCESS_QUERY_INFORMATION, 0, child_id);
+        // Try PROCESS_QUERY_INFORMATION first, fallback to limited if needed
+        let mut handle: HANDLE = OpenProcess(PROCESS_QUERY_INFORMATION, 0, child_id);
         if handle.is_null() {
-            return Ok(ResourceUsage::default());
+            handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child_id);
+            if handle.is_null() {
+                return Ok(ResourceUsage::default());
+            }
         }
         
         let mut creation_time = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
@@ -73,7 +79,7 @@ fn get_child_process_times(child_id: u32) -> Result<ResourceUsage, Box<dyn std::
         let mut kernel_time = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
         let mut user_time = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
         
-        let result = GetProcessTimes(
+        let timing_result = GetProcessTimes(
             handle,
             &mut creation_time,
             &mut exit_time,
@@ -81,10 +87,42 @@ fn get_child_process_times(child_id: u32) -> Result<ResourceUsage, Box<dyn std::
             &mut user_time,
         );
         
+        let mut max_memory_kb = 0u64;
+        
+        // Get memory information
+        let mut mem_counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            PageFaultCount: 0,
+            PeakWorkingSetSize: 0,
+            WorkingSetSize: 0,
+            QuotaPeakPagedPoolUsage: 0,
+            QuotaPagedPoolUsage: 0,
+            QuotaPeakNonPagedPoolUsage: 0,
+            QuotaNonPagedPoolUsage: 0,
+            PagefileUsage: 0,
+            PeakPagefileUsage: 0,
+        };
+        
+        let memory_result = GetProcessMemoryInfo(
+            handle,
+            &mut mem_counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        );
+        
+        if memory_result != 0 {
+            // Use PeakWorkingSetSize (peak physical memory usage) converted to KB
+            max_memory_kb = mem_counters.PeakWorkingSetSize as u64 / 1024;
+        }
+        
         CloseHandle(handle);
         
-        if result == 0 {
-            return Ok(ResourceUsage::default());
+        if timing_result == 0 {
+            // Even if timing fails, we might have memory info
+            return Ok(ResourceUsage {
+                user_time: 0.0,
+                system_time: 0.0,
+                max_memory: max_memory_kb,
+            });
         }
         
         let user_seconds = filetime_to_seconds(&user_time);
@@ -93,7 +131,7 @@ fn get_child_process_times(child_id: u32) -> Result<ResourceUsage, Box<dyn std::
         Ok(ResourceUsage {
             user_time: user_seconds,
             system_time: kernel_seconds,
-            max_memory: 0, // Memory info requires additional APIs
+            max_memory: max_memory_kb,
         })
     }
 }
